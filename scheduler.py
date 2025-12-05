@@ -1,97 +1,129 @@
 import pandas as pd
-from config import GUARDS_DB, SHIFTS, DAYS, MAX_HOURS_PER_WEEK, SHIFT_DURATION_HOURS
+from ortools.sat.python import cp_model
+from config import GUARDS_DB, SHIFTS, DAYS, MAX_HOURS_PER_WEEK, SHIFT_DURATION_HOURS, get_shift_requirements
 
 class Guard:
     """
     Represents a security guard.
     Tracks assigned hours and total cost.
     """
-    def __init__(self, name, rate):
+    def __init__(self, name, rate, qualifications):
         self.name = name
         self.rate = rate
+        self.qualifications = set(qualifications)
         self.hours_assigned = 0
         self.total_pay = 0.0
-        self.schedule = {} # Key: Day, Value: Shift
 
-    def can_work(self, hours):
-        """Checks if assigning these hours would exceed the weekly limit."""
-        # Cost-saving logic: Strictly enforce the 40-hour cap to prevent overtime pay.
-        return (self.hours_assigned + hours) <= MAX_HOURS_PER_WEEK
-
-    def assign_shift(self, day, shift, hours):
-        """Assigns a shift to the guard and updates their stats."""
-        self.hours_assigned += hours
-        self.total_pay += hours * self.rate
-        self.schedule[day] = shift
+    def has_qualification(self, required_qual):
+        """Checks if the guard has a specific qualification."""
+        return required_qual in self.qualifications
 
     def __repr__(self):
-        return f"{self.name} (${self.rate}/hr) - {self.hours_assigned} hrs"
+        return f"{self.name} (${self.rate}/hr)"
 
 
 class Scheduler:
     """
-    Engine for generating the weekly schedule.
+    Engine for generating the weekly schedule using Google OR-Tools.
+    This guarantees an OPTIMAL schedule based on constraints.
     """
-    def __init__(self):
-        self.guards = [Guard(g["name"], g["rate"]) for g in GUARDS_DB]
+    def __init__(self, active_guards_names=None):
+        # Filter active guards if provided, else use all
+        if active_guards_names:
+            self.guards = [Guard(g["name"], g["rate"], g["qualifications"]) 
+                           for g in GUARDS_DB if g["name"] in active_guards_names]
+        else:
+            self.guards = [Guard(g["name"], g["rate"], g["qualifications"]) for g in GUARDS_DB]
+            
         self.schedule_data = [] # List of dictionaries for DataFrame
         self.unfilled_shifts = []
+        self.status = "UNKNOWN"
 
     def generate_schedule(self):
         """
-        Generates the schedule by iterating through every required shift
-        and assigning the best available guard.
+        Generates the schedule using Constraint Programming (CP-SAT).
         """
-        for day in DAYS:
-            for shift_name in SHIFTS:
-                assigned_guard = self._find_best_guard(day, shift_name)
-                
-                if assigned_guard:
-                    assigned_guard.assign_shift(day, shift_name, SHIFT_DURATION_HOURS)
-                    self.schedule_data.append({
-                        "Day": day,
-                        "Shift": shift_name,
-                        "Guard": assigned_guard.name,
-                        "Hours": SHIFT_DURATION_HOURS,
-                        "Cost": SHIFT_DURATION_HOURS * assigned_guard.rate
-                    })
-                else:
-                    self.unfilled_shifts.append(f"{day} - {shift_name}")
-                    self.schedule_data.append({
-                        "Day": day,
-                        "Shift": shift_name,
-                        "Guard": "UNFILLED",
-                        "Hours": 0,
-                        "Cost": 0
-                    })
+        model = cp_model.CpModel()
 
-    def _find_best_guard(self, day, shift):
-        """
-        Finds the most suitable guard for a specific shift.
-        Logic:
-        1. Filter guards who haven't maxed out hours (Hard Constraint).
-        2. Filter guards who aren't already working this day (Simple rule: 1 shift/day for simplicity, though not strictly required by prompt, it's good practice).
-        3. Sort by current hours assigned (ascending) to ensure FAIRNESS.
-        """
-        available_guards = []
-        for guard in self.guards:
-            # Check hard constraint: Overtime
-            if not guard.can_work(SHIFT_DURATION_HOURS):
-                continue
-            
-            # Check if already working this day (prevent double booking)
-            if day in guard.schedule:
-                continue
+        # --- Variables ---
+        # x[d, s, g] is a boolean variable: 1 if guard g works on day d, shift s; 0 otherwise.
+        shifts = {}
+        for d, day in enumerate(DAYS):
+            for s, shift in enumerate(SHIFTS):
+                for g, guard in enumerate(self.guards):
+                    shifts[(d, s, g)] = model.NewBoolVar(f'shift_d{d}_s{s}_g{g}')
 
-            available_guards.append(guard)
+        # --- Constraints ---
 
-        # Fairness Logic: Sort by least hours assigned first.
-        # This ensures we distribute hours evenly as we go.
-        available_guards.sort(key=lambda x: x.hours_assigned)
+        # 1. Coverage Constraint: Each shift must be assigned to EXACTLY ONE guard.
+        # Note: If we have insufficient guards, this model will be INFEASIBLE.
+        # To handle this gracefully, we could use soft constraints, but for this "Hard" requirement
+        # we will enforce it and report status.
+        for d, day in enumerate(DAYS):
+            for s, shift in enumerate(SHIFTS):
+                model.Add(sum(shifts[(d, s, g)] for g in range(len(self.guards))) == 1)
 
-        if available_guards:
-            return available_guards[0]
-        return None
+        # 2. Qualification Constraint: Guard must have required skills for the shift.
+        for d, day in enumerate(DAYS):
+            for s, shift in enumerate(SHIFTS):
+                required_quals = get_shift_requirements(day, shift)
+                for g, guard in enumerate(self.guards):
+                    for req in required_quals:
+                        if not guard.has_qualification(req):
+                            # If guard lacks skill, force their variable to 0 for this shift
+                            model.Add(shifts[(d, s, g)] == 0)
+
+        # 3. Max Hours Constraint: No guard works > 40 hours.
+        # Total shifts per guard * 8 hours <= 40
+        # Which simplifies to: Total shifts per guard <= 5
+        max_shifts_per_guard = MAX_HOURS_PER_WEEK // SHIFT_DURATION_HOURS
+        for g in range(len(self.guards)):
+            model.Add(sum(shifts[(d, s, g)] for d in range(len(DAYS)) for s in range(len(SHIFTS))) <= max_shifts_per_guard)
+
+        # --- Objective ---
+        # Minimize Total Cost
+        # Cost = Sum(Guard Rate * 8 hours * IsAssigned)
+        total_cost = sum(
+            shifts[(d, s, g)] * int(self.guards[g].rate * SHIFT_DURATION_HOURS)
+            for d in range(len(DAYS))
+            for s in range(len(SHIFTS))
+            for g in range(len(self.guards))
+        )
+        model.Minimize(total_cost)
+
+        # --- Solve ---
+        solver = cp_model.CpSolver()
+        status = solver.Solve(model)
+        self.status = solver.StatusName(status)
+
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            self._extract_solution(solver, shifts)
+        else:
+            self.unfilled_shifts.append("Optimization Failed: Constraints could not be met (likely insufficient qualified guards).")
+
+    def _extract_solution(self, solver, shifts):
+        """Extracts the schedule from the solver's solution."""
+        for d, day in enumerate(DAYS):
+            for s, shift in enumerate(SHIFTS):
+                is_filled = False
+                for g, guard in enumerate(self.guards):
+                    if solver.Value(shifts[(d, s, g)]) == 1:
+                        guard.hours_assigned += SHIFT_DURATION_HOURS
+                        guard.total_pay += SHIFT_DURATION_HOURS * guard.rate
+                        
+                        self.schedule_data.append({
+                            "Day": day,
+                            "Shift": shift,
+                            "Guard": guard.name,
+                            "Qualifications": ", ".join(guard.qualifications),
+                            "Hours": SHIFT_DURATION_HOURS,
+                            "Cost": SHIFT_DURATION_HOURS * guard.rate
+                        })
+                        is_filled = True
+                        break
+                if not is_filled:
+                     # This shouldn't happen if status is OPTIMAL/FEASIBLE and coverage constraint is on
+                     self.unfilled_shifts.append(f"{day} - {shift}")
 
     def get_schedule_df(self):
         """Returns the schedule as a pandas DataFrame."""
@@ -102,9 +134,16 @@ class Scheduler:
         total_cost = sum(g.total_pay for g in self.guards)
         total_hours = sum(g.hours_assigned for g in self.guards)
         
+        # Calculate Efficiency Score (Simple metric: Cost / Hours)
+        # Lower is better, but for "Score" maybe we want 100 - (something).
+        # Let's just return the raw Avg Hourly Rate as efficiency metric for now.
+        avg_rate = total_cost / total_hours if total_hours > 0 else 0
+        
         return {
             "total_cost": total_cost,
             "total_hours": total_hours,
             "unfilled_shifts": self.unfilled_shifts,
+            "efficiency_avg_rate": avg_rate,
+            "status": self.status,
             "guard_stats": [(g.name, g.hours_assigned, g.total_pay) for g in self.guards]
         }
